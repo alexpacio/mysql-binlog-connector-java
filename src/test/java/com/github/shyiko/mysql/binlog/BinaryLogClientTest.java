@@ -15,6 +15,13 @@
  */
 package com.github.shyiko.mysql.binlog;
 
+import com.github.shyiko.mysql.binlog.event.Event;
+import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
+import com.github.shyiko.mysql.binlog.event.EventType;
+import com.github.shyiko.mysql.binlog.event.GtidEventData;
+import com.github.shyiko.mysql.binlog.event.MySqlGtid;
+import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
+import com.github.shyiko.mysql.binlog.event.XidEventData;
 import com.github.shyiko.mysql.binlog.jmx.BinaryLogClientStatistics;
 import com.github.shyiko.mysql.binlog.network.SocketFactory;
 import org.testng.annotations.Test;
@@ -26,6 +33,9 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -37,6 +47,8 @@ import static org.testng.Assert.assertTrue;
  * @author <a href="mailto:stanley.shyiko@gmail.com">Stanley Shyiko</a>
  */
 public class BinaryLogClientTest {
+
+    private static final String SERVER_UUID = "24bc7850-2c16-11e6-a073-0242ac110002";
 
     @Test
     public void testEventListenersManagement() {
@@ -113,6 +125,46 @@ public class BinaryLogClientTest {
         new BinaryLogClient("localhost", 3306, "root", "mysql").setEventDeserializer(null);
     }
 
+    @Test
+    public void testTransactionPayloadNotifiesInnerEvents() {
+        BinaryLogClient binaryLogClient = new BinaryLogClient("localhost", 3306, "root", "mysql");
+        final List<Event> notifiedEvents = new ArrayList<Event>();
+        binaryLogClient.registerEventListener(new BinaryLogClient.EventListener() {
+            @Override
+            public void onEvent(Event event) {
+                notifiedEvents.add(event);
+            }
+        });
+
+        binaryLogClient.handleEvent(transactionPayloadEvent(500L, 12345L, xidEvent(111L), xidEvent(222L)));
+
+        assertEquals(notifiedEvents.size(), 2);
+        assertEquals(notifiedEvents.get(0).getHeader().getEventType(), EventType.XID);
+        assertEquals(((XidEventData) notifiedEvents.get(0).getData()).getXid(), 111L);
+        assertEquals(((XidEventData) notifiedEvents.get(1).getData()).getXid(), 222L);
+
+        EventHeaderV4 firstHeader = notifiedEvents.get(0).getHeader();
+        assertEquals(firstHeader.getPosition(), 11845L);
+        assertEquals(firstHeader.getNextPosition(), 12345L);
+        assertEquals(binaryLogClient.getBinlogPosition(), 12345L);
+    }
+
+    @Test
+    public void testGtidSetAdvancesWhenCompressedTransactionCommitsInsidePayload() {
+        BinaryLogClient binaryLogClient = new BinaryLogClient("localhost", 3306, "root", "mysql");
+        binaryLogClient.setGtidSet(SERVER_UUID + ":1-5");
+
+        binaryLogClient.handleEvent(gtidEvent(6));
+        assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-5");
+
+        binaryLogClient.handleEvent(transactionPayloadEvent(500L, 12345L, xidEvent(31L)));
+        assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-6");
+
+        binaryLogClient.handleEvent(gtidEvent(7));
+        binaryLogClient.handleEvent(transactionPayloadEvent(600L, 12945L, xidEvent(32L)));
+        assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-7");
+    }
+
     @Test(timeOut = 15000)
     public void testDisconnectWhileBlockedByFBRead() throws Exception {
         final BinaryLogClient binaryLogClient = new BinaryLogClient("localhost", 33061, "root", "mysql");
@@ -176,6 +228,35 @@ public class BinaryLogClientTest {
             assertEquals(readAttempted.getCount(), 0);
             assertTrue(e.getMessage().contains("Failed to connect to MySQL"));
         }
+    }
+
+    private Event gtidEvent(long transactionId) {
+        EventHeaderV4 header = new EventHeaderV4();
+        header.setEventType(EventType.GTID);
+        return new Event(header, new GtidEventData(
+            MySqlGtid.fromString(SERVER_UUID + ":" + transactionId),
+            (byte) 0, 0L, 0L, 0L, 0L, 0L, 0, 0
+        ));
+    }
+
+    private Event xidEvent(long xid) {
+        EventHeaderV4 header = new EventHeaderV4();
+        header.setEventType(EventType.XID);
+        header.setEventLength(27L);
+        header.setNextPosition(27L);
+        XidEventData data = new XidEventData();
+        data.setXid(xid);
+        return new Event(header, data);
+    }
+
+    private Event transactionPayloadEvent(long eventLength, long nextPosition, Event... uncompressedEvents) {
+        EventHeaderV4 header = new EventHeaderV4();
+        header.setEventType(EventType.TRANSACTION_PAYLOAD);
+        header.setEventLength(eventLength);
+        header.setNextPosition(nextPosition);
+        TransactionPayloadEventData data = new TransactionPayloadEventData();
+        data.setUncompressedEvents(new ArrayList<Event>(Arrays.asList(uncompressedEvents)));
+        return new Event(header, data);
     }
 
     /*

@@ -17,13 +17,18 @@ package com.github.shyiko.mysql.binlog.event.deserialization;
 
 import com.github.shyiko.mysql.binlog.event.EventType;
 import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
-import com.github.shyiko.mysql.binlog.event.XAPrepareEventData;
+import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
+import com.github.shyiko.mysql.binlog.event.XidEventData;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import org.testng.annotations.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertTrue;
 
 /**
  * @author <a href="mailto:somesh.malviya@booking.com">Somesh Malviya</a>
@@ -71,6 +76,7 @@ public class TransactionPayloadEventDataDeserializerTest {
     private static final int PAYLOAD_SIZE = 451;
     private static final int UNCOMPRESSED_SIZE = 960;
     private static final int NUMBER_OF_UNCOMPRESSED_EVENTS = 4;
+    private static final int XID_EVENT_TYPE_CODE = 16;
     private static final String UNCOMPRESSED_UPDATE_EVENT =
       new StringBuilder()
           .append(
@@ -96,5 +102,90 @@ public class TransactionPayloadEventDataDeserializerTest {
           assertEquals(EventType.EXT_UPDATE_ROWS, transactionPayloadEventData.getUncompressedEvents().get(2).getHeader().getEventType());
           assertEquals(EventType.XID, transactionPayloadEventData.getUncompressedEvents().get(3).getHeader().getEventType());
           assertEquals(UNCOMPRESSED_UPDATE_EVENT, transactionPayloadEventData.getUncompressedEvents().get(2).getData().toString());
+    }
+
+    @Test
+    public void deserializeUncompressedPayload() throws IOException {
+        byte[] innerEvent = xidEventBytes(123L);
+        byte[] body = payloadEventBody(
+            TransactionPayloadEventDataDeserializer.COMPRESSION_TYPE_NONE, null, innerEvent);
+        TransactionPayloadEventDataDeserializer deserializer = new TransactionPayloadEventDataDeserializer();
+
+        TransactionPayloadEventData transactionPayloadEventData =
+            deserializer.deserialize(new ByteArrayInputStream(body));
+
+        assertEquals(TransactionPayloadEventDataDeserializer.COMPRESSION_TYPE_NONE,
+            transactionPayloadEventData.getCompressionType());
+        assertEquals(innerEvent.length, transactionPayloadEventData.getUncompressedSize());
+        assertEquals(1, transactionPayloadEventData.getUncompressedEvents().size());
+        assertEquals(123L,
+            ((XidEventData) transactionPayloadEventData.getUncompressedEvents().get(0).getData()).getXid());
+    }
+
+    @Test(expectedExceptions = IOException.class, expectedExceptionsMessageRegExp = "Unsupported.*")
+    public void deserializeUnsupportedCompressionType() throws IOException {
+        TransactionPayloadEventDataDeserializer deserializer = new TransactionPayloadEventDataDeserializer();
+        deserializer.deserialize(new ByteArrayInputStream(payloadEventBody(42, 27, new byte[] {1, 2, 3})));
+    }
+
+    @Test
+    public void deserializeAppliesCompatibilityModesToInnerEvents() throws IOException {
+        TransactionPayloadEventDataDeserializer deserializer = new TransactionPayloadEventDataDeserializer();
+        EventDeserializer outerDeserializer = new EventDeserializer();
+        outerDeserializer.setEventDataDeserializer(EventType.TRANSACTION_PAYLOAD, deserializer);
+        outerDeserializer.setCompatibilityMode(EventDeserializer.CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY);
+
+        TransactionPayloadEventData transactionPayloadEventData =
+            deserializer.deserialize(new ByteArrayInputStream(DATA));
+        UpdateRowsEventData updateRowsEventData =
+            (UpdateRowsEventData) transactionPayloadEventData.getUncompressedEvents().get(2).getData();
+
+        assertTrue(updateRowsEventData.getRows().get(0).getValue()[1] instanceof byte[]);
+    }
+
+    private static byte[] xidEventBytes(long xid) {
+        ByteBuffer buf = ByteBuffer.allocate(27).order(ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(1000);
+        buf.put((byte) XID_EVENT_TYPE_CODE);
+        buf.putInt(1);
+        buf.putInt(27);
+        buf.putInt(0);
+        buf.putShort((short) 0);
+        buf.putLong(xid);
+        return buf.array();
+    }
+
+    private static byte[] payloadEventBody(Integer compressionType, Integer uncompressedSize, byte[] payload) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        if (compressionType != null) {
+            writePacked(out, TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_COMPRESSION_TYPE_FIELD);
+            writePacked(out, packedLength(compressionType));
+            writePacked(out, compressionType);
+        }
+        if (uncompressedSize != null) {
+            writePacked(out, TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_UNCOMPRESSED_SIZE_FIELD);
+            writePacked(out, packedLength(uncompressedSize));
+            writePacked(out, uncompressedSize);
+        }
+        writePacked(out, TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_SIZE_FIELD);
+        writePacked(out, packedLength(payload.length));
+        writePacked(out, payload.length);
+        out.write(TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_HEADER_END_MARK);
+        out.write(payload, 0, payload.length);
+        return out.toByteArray();
+    }
+
+    private static void writePacked(ByteArrayOutputStream out, int value) {
+        if (value < 251) {
+            out.write(value);
+        } else {
+            out.write(0xFC);
+            out.write(value & 0xFF);
+            out.write((value >> 8) & 0xFF);
+        }
+    }
+
+    private static int packedLength(int value) {
+        return value < 251 ? 1 : 3;
     }
 }

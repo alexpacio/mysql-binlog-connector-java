@@ -217,6 +217,8 @@ public class EventDeserializer {
             deserializer.setDeserializeIntegerAsByteArray(
                 compatibilitySet.contains(CompatibilityMode.INTEGER_AS_BYTE_ARRAY)
             );
+        } else if (eventDataDeserializer instanceof TransactionPayloadEventDataDeserializer) {
+            ((TransactionPayloadEventDataDeserializer) eventDataDeserializer).setCompatibilityMode(compatibilitySet);
         }
     }
 

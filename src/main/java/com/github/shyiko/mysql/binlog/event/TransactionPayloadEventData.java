@@ -8,7 +8,7 @@ public class TransactionPayloadEventData implements EventData {
     private long uncompressedSize;
     private int compressionType;
     private byte[] payload;
-    private ArrayList<Event> uncompressedEvents;
+    private ArrayList<Event> uncompressedEvents = new ArrayList<Event>();
 
     public ArrayList<Event> getUncompressedEvents() {
         return uncompressedEvents;
@@ -57,7 +57,7 @@ public class TransactionPayloadEventData implements EventData {
         sb.append("{compression_type=").append(compressionType).append(", payload_size=").append(payloadSize).append(", uncompressed_size='").append(uncompressedSize).append('\'');
         sb.append(", payload: ");
         sb.append("\n");
-        for (Event e : uncompressedEvents) {
+        for (Event e : getUncompressedEvents()) {
             sb.append(e.toString());
             sb.append("\n");
         }

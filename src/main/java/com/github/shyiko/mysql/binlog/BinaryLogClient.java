@@ -25,6 +25,7 @@ import com.github.shyiko.mysql.binlog.event.MariadbGtidEventData;
 import com.github.shyiko.mysql.binlog.event.MariadbGtidListEventData;
 import com.github.shyiko.mysql.binlog.event.QueryEventData;
 import com.github.shyiko.mysql.binlog.event.RotateEventData;
+import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.event.deserialization.AnnotateRowsEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.ChecksumType;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializationException;
@@ -1152,9 +1153,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                 }
                 if (isConnected()) {
                     eventLastSeen = System.currentTimeMillis();
-                    updateGtidSet(event);
-                    notifyEventListeners(event);
-                    updateClientBinlogFilenameAndPosition(event);
+                    handleEvent(event);
                 }
             }
         } catch (Exception e) {
@@ -1171,6 +1170,43 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                     disconnectChannel();
                 }
             }
+        }
+    }
+
+    void handleEvent(Event event) {
+        EventType eventType = event.getHeader().getEventType();
+        if (eventType == EventType.TRANSACTION_PAYLOAD &&
+            EventDataWrapper.internal(event.getData()) instanceof TransactionPayloadEventData) {
+            notifyTransactionPayloadEvent(event);
+            updateClientBinlogFilenameAndPosition(event);
+        } else {
+            updateGtidSet(event);
+            notifyEventListeners(event);
+            updateClientBinlogFilenameAndPosition(event);
+        }
+    }
+
+    private void notifyTransactionPayloadEvent(Event transactionPayloadEvent) {
+        TransactionPayloadEventData transactionPayloadEventData =
+            (TransactionPayloadEventData) EventDataWrapper.internal(transactionPayloadEvent.getData());
+        if (transactionPayloadEventData.getUncompressedEvents() == null) {
+            return;
+        }
+        for (Event event : transactionPayloadEventData.getUncompressedEvents()) {
+            restampInnerEventHeader(transactionPayloadEvent, event);
+            updateGtidSet(event);
+            notifyEventListeners(event);
+        }
+    }
+
+    private void restampInnerEventHeader(Event transactionPayloadEvent, Event innerEvent) {
+        EventHeader transactionPayloadHeader = transactionPayloadEvent.getHeader();
+        EventHeader innerHeader = innerEvent.getHeader();
+        if (transactionPayloadHeader instanceof EventHeaderV4 && innerHeader instanceof EventHeaderV4) {
+            EventHeaderV4 transactionPayloadHeaderV4 = (EventHeaderV4) transactionPayloadHeader;
+            EventHeaderV4 innerHeaderV4 = (EventHeaderV4) innerHeader;
+            innerHeaderV4.setEventLength(transactionPayloadHeaderV4.getEventLength());
+            innerHeaderV4.setNextPosition(transactionPayloadHeaderV4.getNextPosition());
         }
     }
 
