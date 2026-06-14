@@ -15,6 +15,7 @@
  */
 package com.github.shyiko.mysql.binlog.event.deserialization;
 
+import com.github.shyiko.mysql.binlog.event.Event;
 import com.github.shyiko.mysql.binlog.event.EventType;
 import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
@@ -26,6 +27,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
@@ -96,12 +99,15 @@ public class TransactionPayloadEventDataDeserializerTest {
           assertEquals(COMPRESSION_TYPE, transactionPayloadEventData.getCompressionType());
           assertEquals(PAYLOAD_SIZE, transactionPayloadEventData.getPayloadSize());
           assertEquals(UNCOMPRESSED_SIZE, transactionPayloadEventData.getUncompressedSize());
-          assertEquals(NUMBER_OF_UNCOMPRESSED_EVENTS, transactionPayloadEventData.getUncompressedEvents().size());
-          assertEquals(EventType.QUERY, transactionPayloadEventData.getUncompressedEvents().get(0).getHeader().getEventType());
-          assertEquals(EventType.TABLE_MAP, transactionPayloadEventData.getUncompressedEvents().get(1).getHeader().getEventType());
-          assertEquals(EventType.EXT_UPDATE_ROWS, transactionPayloadEventData.getUncompressedEvents().get(2).getHeader().getEventType());
-          assertEquals(EventType.XID, transactionPayloadEventData.getUncompressedEvents().get(3).getHeader().getEventType());
-          assertEquals(UNCOMPRESSED_UPDATE_EVENT, transactionPayloadEventData.getUncompressedEvents().get(2).getData().toString());
+          // Inner events are streamed lazily, not materialized on the event data.
+          assertTrue(transactionPayloadEventData.getUncompressedEvents().isEmpty());
+          List<Event> innerEvents = drain(deserializer.iterator(transactionPayloadEventData));
+          assertEquals(NUMBER_OF_UNCOMPRESSED_EVENTS, innerEvents.size());
+          assertEquals(EventType.QUERY, innerEvents.get(0).getHeader().getEventType());
+          assertEquals(EventType.TABLE_MAP, innerEvents.get(1).getHeader().getEventType());
+          assertEquals(EventType.EXT_UPDATE_ROWS, innerEvents.get(2).getHeader().getEventType());
+          assertEquals(EventType.XID, innerEvents.get(3).getHeader().getEventType());
+          assertEquals(UNCOMPRESSED_UPDATE_EVENT, innerEvents.get(2).getData().toString());
     }
 
     @Test
@@ -117,9 +123,9 @@ public class TransactionPayloadEventDataDeserializerTest {
         assertEquals(TransactionPayloadEventDataDeserializer.COMPRESSION_TYPE_NONE,
             transactionPayloadEventData.getCompressionType());
         assertEquals(innerEvent.length, transactionPayloadEventData.getUncompressedSize());
-        assertEquals(1, transactionPayloadEventData.getUncompressedEvents().size());
-        assertEquals(123L,
-            ((XidEventData) transactionPayloadEventData.getUncompressedEvents().get(0).getData()).getXid());
+        List<Event> innerEvents = drain(deserializer.iterator(transactionPayloadEventData));
+        assertEquals(1, innerEvents.size());
+        assertEquals(123L, ((XidEventData) innerEvents.get(0).getData()).getXid());
     }
 
     @Test(expectedExceptions = IOException.class, expectedExceptionsMessageRegExp = "Unsupported.*")
@@ -137,10 +143,25 @@ public class TransactionPayloadEventDataDeserializerTest {
 
         TransactionPayloadEventData transactionPayloadEventData =
             deserializer.deserialize(new ByteArrayInputStream(DATA));
+        List<Event> innerEvents = drain(deserializer.iterator(transactionPayloadEventData));
         UpdateRowsEventData updateRowsEventData =
-            (UpdateRowsEventData) transactionPayloadEventData.getUncompressedEvents().get(2).getData();
+            (UpdateRowsEventData) innerEvents.get(2).getData();
 
         assertTrue(updateRowsEventData.getRows().get(0).getValue()[1] instanceof byte[]);
+    }
+
+    private static List<Event> drain(TransactionPayloadEventDataDeserializer.InnerEventIterator iterator)
+            throws IOException {
+        List<Event> events = new ArrayList<Event>();
+        try {
+            Event event;
+            while ((event = iterator.next()) != null) {
+                events.add(event);
+            }
+        } finally {
+            iterator.close();
+        }
+        return events;
     }
 
     private static byte[] xidEventBytes(long xid) {

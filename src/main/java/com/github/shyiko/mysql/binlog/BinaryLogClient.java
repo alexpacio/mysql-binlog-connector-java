@@ -37,6 +37,7 @@ import com.github.shyiko.mysql.binlog.event.deserialization.MariadbGtidEventData
 import com.github.shyiko.mysql.binlog.event.deserialization.MariadbGtidListEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.QueryEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.RotateEventDataDeserializer;
+import com.github.shyiko.mysql.binlog.event.deserialization.TransactionPayloadEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.jmx.BinaryLogClientMXBean;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
@@ -1189,13 +1190,56 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private void notifyTransactionPayloadEvent(Event transactionPayloadEvent) {
         TransactionPayloadEventData transactionPayloadEventData =
             (TransactionPayloadEventData) EventDataWrapper.internal(transactionPayloadEvent.getData());
-        if (transactionPayloadEventData.getUncompressedEvents() == null) {
-            return;
+        // Decompress and parse the inner events one at a time, so a transaction whose uncompressed
+        // image exceeds the 2GB Java-array limit (or simply does not fit in heap) is streamed through
+        // with bounded memory instead of being materialized whole. notifyEventListeners blocks on the
+        // consumer, so backpressure now applies to the parse as well as the emission.
+        TransactionPayloadEventDataDeserializer.InnerEventIterator iterator = null;
+        try {
+            iterator = eventDeserializer.newTransactionPayloadEventIterator(transactionPayloadEventData);
+            while (true) {
+                Event innerEvent;
+                try {
+                    innerEvent = iterator.next();
+                } catch (IOException | RuntimeException e) {
+                    // A decompression/parse failure part-way through the payload cannot be cleanly
+                    // skipped the way a standalone undeserializable event can (earlier inner events
+                    // were already emitted), but surfacing it as a communication failure would trigger
+                    // a reconnect loop. Report it and stop unwrapping this transaction; the position is
+                    // only durably committed on the inner XID/COMMIT, so an incomplete transaction is
+                    // replayed on the next restart.
+                    notifyEventDeserializationFailure(e);
+                    break;
+                }
+                if (innerEvent == null) {
+                    break;
+                }
+                restampInnerEventHeader(transactionPayloadEvent, innerEvent);
+                updateGtidSet(innerEvent);
+                notifyEventListeners(innerEvent);
+            }
+        } catch (IOException e) {
+            // Failure opening the cursor (e.g. unsupported compression type): nothing emitted yet.
+            notifyEventDeserializationFailure(e);
+        } finally {
+            if (iterator != null) {
+                try {
+                    iterator.close();
+                } catch (IOException e) {
+                    // best-effort release of the streaming decompressor
+                }
+            }
+            // Release the compressed payload promptly: the binlog client otherwise pins this event
+            // (and its ~payload-sized byte[]) until the next network event arrives.
+            transactionPayloadEventData.setPayload(null);
         }
-        for (Event event : transactionPayloadEventData.getUncompressedEvents()) {
-            restampInnerEventHeader(transactionPayloadEvent, event);
-            updateGtidSet(event);
-            notifyEventListeners(event);
+    }
+
+    private void notifyEventDeserializationFailure(Exception e) {
+        if (isConnected()) {
+            for (LifecycleListener lifecycleListener : lifecycleListeners) {
+                lifecycleListener.onEventDeserializationFailure(this, e);
+            }
         }
     }
 

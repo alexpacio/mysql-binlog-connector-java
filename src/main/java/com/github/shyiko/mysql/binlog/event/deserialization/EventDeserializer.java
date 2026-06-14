@@ -295,9 +295,12 @@ public class EventDeserializer {
         TransactionPayloadEventData transactionPayloadEventData = (TransactionPayloadEventData) eventData;
 
         /**
-         * Handling for TABLE_MAP events withing the transaction payload event. This is to ensure that for the table map
-         * events within the transaction payload, the target table id and the event gets added to the
-         * tableMapEventByTableId map. This is map is later used while deserializing rows.
+         * Handling for TABLE_MAP events within the transaction payload event, so a row event in the
+         * payload resolves against its table map. Inner events are now parsed lazily and streamed
+         * (see {@link #newTransactionPayloadEventIterator}), each payload getting a self-contained
+         * inner deserializer whose own table-map cache is populated in stream order, so this loop is
+         * a no-op in the streaming path (getUncompressedEvents() is empty). It is kept for a custom
+         * TRANSACTION_PAYLOAD deserializer that still materializes inner events eagerly.
          */
         for (Event event : transactionPayloadEventData.getUncompressedEvents()) {
             if (event.getHeader().getEventType() == EventType.TABLE_MAP && event.getData() != null) {
@@ -306,6 +309,22 @@ public class EventDeserializer {
             }
         }
         return eventData;
+    }
+
+    /**
+     * Opens a streaming cursor over the inner events of a transaction payload, delegating to the
+     * registered {@link TransactionPayloadEventDataDeserializer} (which carries the compatibility
+     * modes applied to the inner deserializer). Used to re-emit inner events one at a time instead
+     * of materializing the whole transaction. The caller must close the returned iterator.
+     */
+    public TransactionPayloadEventDataDeserializer.InnerEventIterator newTransactionPayloadEventIterator(
+            TransactionPayloadEventData eventData) throws IOException {
+        EventDataDeserializer deserializer = eventDataDeserializers.get(EventType.TRANSACTION_PAYLOAD);
+        if (!(deserializer instanceof TransactionPayloadEventDataDeserializer)) {
+            throw new IOException("Cannot stream TRANSACTION_PAYLOAD inner events: registered deserializer is " +
+                (deserializer == null ? "null" : deserializer.getClass().getName()));
+        }
+        return ((TransactionPayloadEventDataDeserializer) deserializer).iterator(eventData);
     }
 
     public EventData deserializeTableMapEventData(ByteArrayInputStream inputStream, EventHeader eventHeader)

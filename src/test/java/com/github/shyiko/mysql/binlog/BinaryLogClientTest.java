@@ -22,10 +22,12 @@ import com.github.shyiko.mysql.binlog.event.GtidEventData;
 import com.github.shyiko.mysql.binlog.event.MySqlGtid;
 import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.event.XidEventData;
+import com.github.shyiko.mysql.binlog.event.deserialization.TransactionPayloadEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.jmx.BinaryLogClientStatistics;
 import com.github.shyiko.mysql.binlog.network.SocketFactory;
 import org.testng.annotations.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -33,8 +35,9 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -136,7 +139,7 @@ public class BinaryLogClientTest {
             }
         });
 
-        binaryLogClient.handleEvent(transactionPayloadEvent(500L, 12345L, xidEvent(111L), xidEvent(222L)));
+        binaryLogClient.handleEvent(transactionPayloadEvent(500L, 12345L, xidEventBytes(111L), xidEventBytes(222L)));
 
         assertEquals(notifiedEvents.size(), 2);
         assertEquals(notifiedEvents.get(0).getHeader().getEventType(), EventType.XID);
@@ -157,11 +160,11 @@ public class BinaryLogClientTest {
         binaryLogClient.handleEvent(gtidEvent(6));
         assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-5");
 
-        binaryLogClient.handleEvent(transactionPayloadEvent(500L, 12345L, xidEvent(31L)));
+        binaryLogClient.handleEvent(transactionPayloadEvent(500L, 12345L, xidEventBytes(31L)));
         assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-6");
 
         binaryLogClient.handleEvent(gtidEvent(7));
-        binaryLogClient.handleEvent(transactionPayloadEvent(600L, 12945L, xidEvent(32L)));
+        binaryLogClient.handleEvent(transactionPayloadEvent(600L, 12945L, xidEventBytes(32L)));
         assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-7");
     }
 
@@ -239,23 +242,38 @@ public class BinaryLogClientTest {
         ));
     }
 
-    private Event xidEvent(long xid) {
-        EventHeaderV4 header = new EventHeaderV4();
-        header.setEventType(EventType.XID);
-        header.setEventLength(27L);
-        header.setNextPosition(27L);
-        XidEventData data = new XidEventData();
-        data.setXid(xid);
-        return new Event(header, data);
+    // The on-the-wire bytes of a standalone XID event (19-byte v4 header + 8-byte xid), as they
+    // appear inside an (uncompressed) transaction payload. Inner events carry no checksum.
+    private static final int XID_EVENT_TYPE_CODE = 16;
+
+    private byte[] xidEventBytes(long xid) {
+        ByteBuffer buf = ByteBuffer.allocate(27).order(ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(1000);                       // timestamp
+        buf.put((byte) XID_EVENT_TYPE_CODE);    // event type
+        buf.putInt(1);                          // server id
+        buf.putInt(27);                         // event length
+        buf.putInt(0);                          // next position
+        buf.putShort((short) 0);                // flags
+        buf.putLong(xid);
+        return buf.array();
     }
 
-    private Event transactionPayloadEvent(long eventLength, long nextPosition, Event... uncompressedEvents) {
+    private Event transactionPayloadEvent(long eventLength, long nextPosition, byte[]... innerEvents) {
         EventHeaderV4 header = new EventHeaderV4();
         header.setEventType(EventType.TRANSACTION_PAYLOAD);
         header.setEventLength(eventLength);
         header.setNextPosition(nextPosition);
+        // Build a COMPRESSION_TYPE_NONE payload so the client unwraps it through the same streaming
+        // path (decompress -> parse -> notify) it uses for real zstd payloads.
+        ByteArrayOutputStream payload = new ByteArrayOutputStream();
+        for (byte[] innerEvent : innerEvents) {
+            payload.write(innerEvent, 0, innerEvent.length);
+        }
         TransactionPayloadEventData data = new TransactionPayloadEventData();
-        data.setUncompressedEvents(new ArrayList<Event>(Arrays.asList(uncompressedEvents)));
+        data.setCompressionType(TransactionPayloadEventDataDeserializer.COMPRESSION_TYPE_NONE);
+        data.setPayload(payload.toByteArray());
+        data.setPayloadSize(payload.size());
+        data.setUncompressedSize(payload.size());
         return new Event(header, data);
     }
 
