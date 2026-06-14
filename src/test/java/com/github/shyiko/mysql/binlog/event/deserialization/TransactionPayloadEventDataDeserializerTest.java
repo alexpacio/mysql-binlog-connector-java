@@ -16,6 +16,7 @@
 package com.github.shyiko.mysql.binlog.event.deserialization;
 
 import com.github.shyiko.mysql.binlog.event.Event;
+import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
 import com.github.shyiko.mysql.binlog.event.EventType;
 import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
@@ -31,6 +32,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 
 /**
@@ -150,6 +152,35 @@ public class TransactionPayloadEventDataDeserializerTest {
         assertTrue(updateRowsEventData.getRows().get(0).getValue()[1] instanceof byte[]);
     }
 
+    @Test
+    public void nextEventTransparentlyUnpacksAndRestampsInnerEvents() throws IOException {
+        EventDeserializer eventDeserializer = new EventDeserializer();
+        // A TRANSACTION_PAYLOAD (next-position 12345) wrapping two XIDs, followed by a standalone XID,
+        // so we also prove the stream stays aligned once the payload's inner events have been drained.
+        byte[] payloadEvent = transactionPayloadEvent(12345L, xidEventBytes(111L), xidEventBytes(222L));
+        ByteArrayInputStream stream = new ByteArrayInputStream(concat(payloadEvent, xidEventBytes(333L)));
+
+        List<Event> events = new ArrayList<Event>();
+        Event event;
+        while ((event = eventDeserializer.nextEvent(stream)) != null) {
+            events.add(event);
+        }
+
+        assertEquals(3, events.size());
+        assertEquals(EventType.XID, events.get(0).getHeader().getEventType());
+        assertEquals(111L, ((XidEventData) events.get(0).getData()).getXid());
+        assertEquals(222L, ((XidEventData) events.get(1).getData()).getXid());
+        assertEquals(333L, ((XidEventData) events.get(2).getData()).getXid());
+
+        // Inner events are restamped with the outer envelope's coordinates...
+        EventHeaderV4 firstInner = (EventHeaderV4) events.get(0).getHeader();
+        assertEquals((long) payloadEvent.length, firstInner.getEventLength());
+        assertEquals(12345L, firstInner.getNextPosition());
+        // ...while the standalone event read after the payload keeps its own (default 27 / 0).
+        assertEquals(27L, ((EventHeaderV4) events.get(2).getHeader()).getEventLength());
+        assertFalse(eventDeserializer.hasBufferedTransactionPayloadEvent());
+    }
+
     private static List<Event> drain(TransactionPayloadEventDataDeserializer.InnerEventIterator iterator)
             throws IOException {
         List<Event> events = new ArrayList<Event>();
@@ -174,6 +205,38 @@ public class TransactionPayloadEventDataDeserializerTest {
         buf.putShort((short) 0);
         buf.putLong(xid);
         return buf.array();
+    }
+
+    private static final int TRANSACTION_PAYLOAD_EVENT_TYPE_CODE = 40;
+
+    // The full on-the-wire bytes of a TRANSACTION_PAYLOAD event (19-byte v4 header + OTW payload header
+    // + uncompressed inner events). The header's event-length is the full event size, so the returned
+    // array's length equals getEventLength() (there is no checksum).
+    private static byte[] transactionPayloadEvent(long nextPosition, byte[]... innerEvents) {
+        ByteArrayOutputStream inner = new ByteArrayOutputStream();
+        for (byte[] innerEvent : innerEvents) {
+            inner.write(innerEvent, 0, innerEvent.length);
+        }
+        byte[] payload = inner.toByteArray();
+        byte[] body = payloadEventBody(
+            TransactionPayloadEventDataDeserializer.COMPRESSION_TYPE_NONE, payload.length, payload);
+
+        ByteBuffer header = ByteBuffer.allocate(19).order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(1000);                                    // timestamp
+        header.put((byte) TRANSACTION_PAYLOAD_EVENT_TYPE_CODE); // event type
+        header.putInt(1);                                       // server id
+        header.putInt(19 + body.length);                        // event length (header + body)
+        header.putInt((int) nextPosition);                      // next position
+        header.putShort((short) 0);                             // flags
+        return concat(header.array(), body);
+    }
+
+    private static byte[] concat(byte[]... arrays) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] array : arrays) {
+            out.write(array, 0, array.length);
+        }
+        return out.toByteArray();
     }
 
     private static byte[] payloadEventBody(Integer compressionType, Integer uncompressedSize, byte[] payload) {

@@ -18,6 +18,7 @@ package com.github.shyiko.mysql.binlog.event.deserialization;
 import com.github.shyiko.mysql.binlog.event.Event;
 import com.github.shyiko.mysql.binlog.event.EventData;
 import com.github.shyiko.mysql.binlog.event.EventHeader;
+import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
 import com.github.shyiko.mysql.binlog.event.EventType;
 import com.github.shyiko.mysql.binlog.event.FormatDescriptionEventData;
 import com.github.shyiko.mysql.binlog.event.LRUCache;
@@ -47,6 +48,15 @@ public class EventDeserializer {
 
     private EventDataDeserializer tableMapEventDataDeserializer;
     private EventDataDeserializer formatDescEventDataDeserializer;
+
+    // State for transparently unpacking a TRANSACTION_PAYLOAD: once nextEvent() reads such an event
+    // it streams the inner events out one per call (carrying the outer envelope's coordinates) before
+    // it touches the underlying stream again. One event is read ahead so callers can tell, without
+    // consuming anything, whether a payload is still being unpacked (see hasBufferedTransactionPayloadEvent).
+    private TransactionPayloadEventDataDeserializer.InnerEventIterator transactionPayloadIterator;
+    private EventHeader transactionPayloadEventHeader;
+    private Event bufferedTransactionPayloadEvent;
+    private IOException transactionPayloadFailure;
 
     public EventDeserializer() {
         this(new EventHeaderV4Deserializer(), new NullEventDataDeserializer());
@@ -228,6 +238,16 @@ public class EventDeserializer {
 	 * @throws IOException if connection gets closed
      */
     public Event nextEvent(ByteArrayInputStream inputStream) throws IOException {
+        // A previously-read TRANSACTION_PAYLOAD is unpacked transparently: emit its remaining inner
+        // events (and surface any deferred unpack failure) before reading more of the stream.
+        if (transactionPayloadFailure != null) {
+            IOException failure = transactionPayloadFailure;
+            transactionPayloadFailure = null;
+            throw failure;
+        }
+        if (bufferedTransactionPayloadEvent != null) {
+            return takeBufferedTransactionPayloadEvent();
+        }
         if (inputStream.peek() == -1) {
             return null;
         }
@@ -241,13 +261,106 @@ public class EventDeserializer {
                 eventData = deserializeTableMapEventData(inputStream, eventHeader);
                 break;
             case TRANSACTION_PAYLOAD:
-                eventData = deserializeTransactionPayloadEventData(inputStream, eventHeader);
-                break;
+                return nextTransactionPayloadEvent(inputStream, eventHeader);
             default:
                 EventDataDeserializer eventDataDeserializer = getEventDataDeserializer(eventHeader.getEventType());
                 eventData = deserializeEventData(inputStream, eventHeader, eventDataDeserializer);
         }
         return new Event(eventHeader, eventData);
+    }
+
+    /**
+     * @return {@code true} while a previously-read TRANSACTION_PAYLOAD still has inner events (or a
+     * deferred unpack failure) to emit. The next {@link #nextEvent} call will return one of them
+     * without touching the underlying stream, so a packet-oriented reader knows not to pull the next
+     * packet yet.
+     */
+    public boolean hasBufferedTransactionPayloadEvent() {
+        return bufferedTransactionPayloadEvent != null || transactionPayloadFailure != null;
+    }
+
+    private Event nextTransactionPayloadEvent(ByteArrayInputStream inputStream, EventHeader eventHeader)
+            throws IOException {
+        EventData eventData = deserializeTransactionPayloadEventData(inputStream, eventHeader);
+        TransactionPayloadEventData transactionPayloadEventData =
+            (TransactionPayloadEventData) EventDataWrapper.internal(eventData);
+        // Decompress and parse the inner events one at a time so a transaction whose uncompressed image
+        // exceeds the 2GB Java-array limit (or simply does not fit in heap) is streamed through with
+        // bounded memory instead of being materialized whole.
+        transactionPayloadEventHeader = eventHeader;
+        transactionPayloadIterator = openTransactionPayloadIterator(transactionPayloadEventData);
+        // The cursor now owns the bytes it needs; drop the compressed copy so the event (which a reader
+        // typically pins until the next one arrives) does not also retain the whole payload.
+        transactionPayloadEventData.setPayload(null);
+        fillTransactionPayloadBuffer();
+        if (bufferedTransactionPayloadEvent != null) {
+            return takeBufferedTransactionPayloadEvent();
+        }
+        // A payload with no inner events is not expected from MySQL; if it happens, surface the wrapper
+        // itself rather than returning null (which a reader would mistake for end-of-stream).
+        closeTransactionPayloadIterator();
+        return new Event(eventHeader, eventData);
+    }
+
+    private Event takeBufferedTransactionPayloadEvent() throws IOException {
+        Event innerEvent = bufferedTransactionPayloadEvent;
+        bufferedTransactionPayloadEvent = null;
+        if (transactionPayloadIterator != null) {
+            try {
+                fillTransactionPayloadBuffer();
+            } catch (IOException e) {
+                // Hand back the (valid) event we already hold and report the parse failure on the
+                // next call, so inner events stay in order.
+                transactionPayloadFailure = e;
+            }
+        }
+        return innerEvent;
+    }
+
+    private void fillTransactionPayloadBuffer() throws IOException {
+        Event innerEvent;
+        try {
+            innerEvent = transactionPayloadIterator.next();
+        } catch (IOException | RuntimeException e) {
+            // A decompression/parse failure partway through the payload cannot be skipped cleanly the
+            // way a standalone undeserializable event can (earlier inner events were already emitted).
+            // Surface it as a plain deserialization failure - never an EOFException/SocketException -
+            // so the reader reports it and moves on instead of treating it as a transport failure and
+            // reconnecting only to refetch and re-fail on the same payload.
+            closeTransactionPayloadIterator();
+            throw new IOException("Failed to deserialize inner event of TRANSACTION_PAYLOAD", e);
+        }
+        if (innerEvent == null) {
+            closeTransactionPayloadIterator();
+            return;
+        }
+        stampOuterEventCoordinates(transactionPayloadEventHeader, innerEvent);
+        bufferedTransactionPayloadEvent = innerEvent;
+    }
+
+    private void closeTransactionPayloadIterator() {
+        if (transactionPayloadIterator != null) {
+            try {
+                transactionPayloadIterator.close();
+            } catch (IOException e) {
+                // best-effort release of the streaming (zstd) decompressor
+            }
+            transactionPayloadIterator = null;
+        }
+        transactionPayloadEventHeader = null;
+    }
+
+    // Inner events are decoded from the payload's own byte stream, so their headers carry positions
+    // relative to that stream. Restamp each one with the outer envelope's length and next-position so
+    // a consumer tracking getBinlogPosition() advances to the transaction boundary, as for any event.
+    private static void stampOuterEventCoordinates(EventHeader outerHeader, Event innerEvent) {
+        EventHeader innerHeader = innerEvent.getHeader();
+        if (outerHeader instanceof EventHeaderV4 && innerHeader instanceof EventHeaderV4) {
+            EventHeaderV4 outerHeaderV4 = (EventHeaderV4) outerHeader;
+            EventHeaderV4 innerHeaderV4 = (EventHeaderV4) innerHeader;
+            innerHeaderV4.setEventLength(outerHeaderV4.getEventLength());
+            innerHeaderV4.setNextPosition(outerHeaderV4.getNextPosition());
+        }
     }
 
     private EventData deserializeFormatDescriptionEventData(ByteArrayInputStream inputStream, EventHeader eventHeader)
@@ -297,9 +410,9 @@ public class EventDeserializer {
         /**
          * Handling for TABLE_MAP events within the transaction payload event, so a row event in the
          * payload resolves against its table map. Inner events are now parsed lazily and streamed
-         * (see {@link #newTransactionPayloadEventIterator}), each payload getting a self-contained
-         * inner deserializer whose own table-map cache is populated in stream order, so this loop is
-         * a no-op in the streaming path (getUncompressedEvents() is empty). It is kept for a custom
+         * (see {@link #nextTransactionPayloadEvent}), each payload getting a self-contained inner
+         * deserializer whose own table-map cache is populated in stream order, so this loop is a no-op
+         * in the streaming path (getUncompressedEvents() is empty). It is kept for a custom
          * TRANSACTION_PAYLOAD deserializer that still materializes inner events eagerly.
          */
         for (Event event : transactionPayloadEventData.getUncompressedEvents()) {
@@ -314,10 +427,9 @@ public class EventDeserializer {
     /**
      * Opens a streaming cursor over the inner events of a transaction payload, delegating to the
      * registered {@link TransactionPayloadEventDataDeserializer} (which carries the compatibility
-     * modes applied to the inner deserializer). Used to re-emit inner events one at a time instead
-     * of materializing the whole transaction. The caller must close the returned iterator.
+     * modes applied to the inner deserializer).
      */
-    public TransactionPayloadEventDataDeserializer.InnerEventIterator newTransactionPayloadEventIterator(
+    private TransactionPayloadEventDataDeserializer.InnerEventIterator openTransactionPayloadIterator(
             TransactionPayloadEventData eventData) throws IOException {
         EventDataDeserializer deserializer = eventDataDeserializers.get(EventType.TRANSACTION_PAYLOAD);
         if (!(deserializer instanceof TransactionPayloadEventDataDeserializer)) {

@@ -25,7 +25,6 @@ import com.github.shyiko.mysql.binlog.event.MariadbGtidEventData;
 import com.github.shyiko.mysql.binlog.event.MariadbGtidListEventData;
 import com.github.shyiko.mysql.binlog.event.QueryEventData;
 import com.github.shyiko.mysql.binlog.event.RotateEventData;
-import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.event.deserialization.AnnotateRowsEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.ChecksumType;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializationException;
@@ -37,7 +36,6 @@ import com.github.shyiko.mysql.binlog.event.deserialization.MariadbGtidEventData
 import com.github.shyiko.mysql.binlog.event.deserialization.MariadbGtidListEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.QueryEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.RotateEventDataDeserializer;
-import com.github.shyiko.mysql.binlog.event.deserialization.TransactionPayloadEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.jmx.BinaryLogClientMXBean;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
@@ -1132,30 +1130,36 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                     completeShutdown = true;
                     break;
                 }
-                Event event;
-                try {
-                    event = eventDeserializer.nextEvent(packetLength == MAX_PACKET_LENGTH ?
-                        new ByteArrayInputStream(readPacketSplitInChunks(inputStream, packetLength - 1)) :
-                        inputStream);
-                    if (event == null) {
-                        throw new EOFException();
-                    }
-                } catch (Exception e) {
-                    Throwable cause = e instanceof EventDataDeserializationException ? e.getCause() : e;
-                    if (cause instanceof EOFException || cause instanceof SocketException) {
-                        throw e;
+                ByteArrayInputStream eventStream = packetLength == MAX_PACKET_LENGTH ?
+                    new ByteArrayInputStream(readPacketSplitInChunks(inputStream, packetLength - 1)) :
+                    inputStream;
+                // A TRANSACTION_PAYLOAD packet unpacks into several inner events; nextEvent() emits the
+                // first and buffers the rest, so keep pulling until this packet (and any payload it
+                // carried) is fully drained before reading the next one off the wire.
+                do {
+                    Event event;
+                    try {
+                        event = eventDeserializer.nextEvent(eventStream);
+                        if (event == null) {
+                            throw new EOFException();
+                        }
+                    } catch (Exception e) {
+                        Throwable cause = e instanceof EventDataDeserializationException ? e.getCause() : e;
+                        if (cause instanceof EOFException || cause instanceof SocketException) {
+                            throw e;
+                        }
+                        if (isConnected()) {
+                            for (LifecycleListener lifecycleListener : lifecycleListeners) {
+                                lifecycleListener.onEventDeserializationFailure(this, e);
+                            }
+                        }
+                        break;
                     }
                     if (isConnected()) {
-                        for (LifecycleListener lifecycleListener : lifecycleListeners) {
-                            lifecycleListener.onEventDeserializationFailure(this, e);
-                        }
+                        eventLastSeen = System.currentTimeMillis();
+                        handleEvent(event);
                     }
-                    continue;
-                }
-                if (isConnected()) {
-                    eventLastSeen = System.currentTimeMillis();
-                    handleEvent(event);
-                }
+                } while (eventDeserializer.hasBufferedTransactionPayloadEvent());
             }
         } catch (Exception e) {
             if (isConnected()) {
@@ -1174,84 +1178,13 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         }
     }
 
+    // TRANSACTION_PAYLOAD events are unpacked transparently by the EventDeserializer, so by the time
+    // an event reaches here it is always an ordinary event (an inner event of a compressed transaction
+    // is indistinguishable from a standalone one) and needs no special handling.
     void handleEvent(Event event) {
-        EventType eventType = event.getHeader().getEventType();
-        if (eventType == EventType.TRANSACTION_PAYLOAD &&
-            EventDataWrapper.internal(event.getData()) instanceof TransactionPayloadEventData) {
-            notifyTransactionPayloadEvent(event);
-            updateClientBinlogFilenameAndPosition(event);
-        } else {
-            updateGtidSet(event);
-            notifyEventListeners(event);
-            updateClientBinlogFilenameAndPosition(event);
-        }
-    }
-
-    private void notifyTransactionPayloadEvent(Event transactionPayloadEvent) {
-        TransactionPayloadEventData transactionPayloadEventData =
-            (TransactionPayloadEventData) EventDataWrapper.internal(transactionPayloadEvent.getData());
-        // Decompress and parse the inner events one at a time, so a transaction whose uncompressed
-        // image exceeds the 2GB Java-array limit (or simply does not fit in heap) is streamed through
-        // with bounded memory instead of being materialized whole. notifyEventListeners blocks on the
-        // consumer, so backpressure now applies to the parse as well as the emission.
-        TransactionPayloadEventDataDeserializer.InnerEventIterator iterator = null;
-        try {
-            iterator = eventDeserializer.newTransactionPayloadEventIterator(transactionPayloadEventData);
-            while (true) {
-                Event innerEvent;
-                try {
-                    innerEvent = iterator.next();
-                } catch (IOException | RuntimeException e) {
-                    // A decompression/parse failure part-way through the payload cannot be cleanly
-                    // skipped the way a standalone undeserializable event can (earlier inner events
-                    // were already emitted), but surfacing it as a communication failure would trigger
-                    // a reconnect loop. Report it and stop unwrapping this transaction; the position is
-                    // only durably committed on the inner XID/COMMIT, so an incomplete transaction is
-                    // replayed on the next restart.
-                    notifyEventDeserializationFailure(e);
-                    break;
-                }
-                if (innerEvent == null) {
-                    break;
-                }
-                restampInnerEventHeader(transactionPayloadEvent, innerEvent);
-                updateGtidSet(innerEvent);
-                notifyEventListeners(innerEvent);
-            }
-        } catch (IOException e) {
-            // Failure opening the cursor (e.g. unsupported compression type): nothing emitted yet.
-            notifyEventDeserializationFailure(e);
-        } finally {
-            if (iterator != null) {
-                try {
-                    iterator.close();
-                } catch (IOException e) {
-                    // best-effort release of the streaming decompressor
-                }
-            }
-            // Release the compressed payload promptly: the binlog client otherwise pins this event
-            // (and its ~payload-sized byte[]) until the next network event arrives.
-            transactionPayloadEventData.setPayload(null);
-        }
-    }
-
-    private void notifyEventDeserializationFailure(Exception e) {
-        if (isConnected()) {
-            for (LifecycleListener lifecycleListener : lifecycleListeners) {
-                lifecycleListener.onEventDeserializationFailure(this, e);
-            }
-        }
-    }
-
-    private void restampInnerEventHeader(Event transactionPayloadEvent, Event innerEvent) {
-        EventHeader transactionPayloadHeader = transactionPayloadEvent.getHeader();
-        EventHeader innerHeader = innerEvent.getHeader();
-        if (transactionPayloadHeader instanceof EventHeaderV4 && innerHeader instanceof EventHeaderV4) {
-            EventHeaderV4 transactionPayloadHeaderV4 = (EventHeaderV4) transactionPayloadHeader;
-            EventHeaderV4 innerHeaderV4 = (EventHeaderV4) innerHeader;
-            innerHeaderV4.setEventLength(transactionPayloadHeaderV4.getEventLength());
-            innerHeaderV4.setNextPosition(transactionPayloadHeaderV4.getNextPosition());
-        }
+        updateGtidSet(event);
+        notifyEventListeners(event);
+        updateClientBinlogFilenameAndPosition(event);
     }
 
     private byte[] readPacketSplitInChunks(ByteArrayInputStream inputStream, int packetLength) throws IOException {
