@@ -33,6 +33,8 @@ import java.util.List;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 
 /**
@@ -134,6 +136,21 @@ public class TransactionPayloadEventDataDeserializerTest {
     public void deserializeUnsupportedCompressionType() throws IOException {
         TransactionPayloadEventDataDeserializer deserializer = new TransactionPayloadEventDataDeserializer();
         deserializer.deserialize(new ByteArrayInputStream(payloadEventBody(42, 27, new byte[] {1, 2, 3})));
+    }
+
+    @Test
+    public void deserializeAllowsCompressedPayloadSizeGreaterThanJavaArrayLimit() throws IOException {
+        long payloadSize = (long) Integer.MAX_VALUE + 5L;
+        TransactionPayloadEventDataDeserializer deserializer = new TransactionPayloadEventDataDeserializer();
+
+        TransactionPayloadEventData transactionPayloadEventData =
+            deserializer.deserialize(new ByteArrayInputStream(payloadEventBodyHeaderOnly(
+                TransactionPayloadEventDataDeserializer.COMPRESSION_TYPE_NONE, null, payloadSize)));
+
+        assertEquals(transactionPayloadEventData.getPayloadSizeLong(), payloadSize);
+        assertEquals(transactionPayloadEventData.getUncompressedSize(), payloadSize);
+        assertNull(transactionPayloadEventData.getPayload());
+        assertNotNull(transactionPayloadEventData.getPayloadInputStream());
     }
 
     @Test
@@ -259,17 +276,62 @@ public class TransactionPayloadEventDataDeserializerTest {
         return out.toByteArray();
     }
 
+    private static byte[] payloadEventBodyHeaderOnly(Integer compressionType, Long uncompressedSize,
+            long payloadSize) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        if (compressionType != null) {
+            writePacked(out, TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_COMPRESSION_TYPE_FIELD);
+            writePacked(out, packedLength(compressionType));
+            writePacked(out, compressionType);
+        }
+        if (uncompressedSize != null) {
+            writePacked(out, TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_UNCOMPRESSED_SIZE_FIELD);
+            writePacked(out, packedLength(uncompressedSize));
+            writePacked(out, uncompressedSize);
+        }
+        writePacked(out, TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_SIZE_FIELD);
+        writePacked(out, packedLength(payloadSize));
+        writePacked(out, payloadSize);
+        out.write(TransactionPayloadEventDataDeserializer.OTW_PAYLOAD_HEADER_END_MARK);
+        return out.toByteArray();
+    }
+
     private static void writePacked(ByteArrayOutputStream out, int value) {
+        writePacked(out, (long) value);
+    }
+
+    private static void writePacked(ByteArrayOutputStream out, long value) {
         if (value < 251) {
-            out.write(value);
-        } else {
+            out.write((int) value);
+        } else if (value <= 0xFFFFL) {
             out.write(0xFC);
-            out.write(value & 0xFF);
-            out.write((value >> 8) & 0xFF);
+            out.write((int) (value & 0xFF));
+            out.write((int) ((value >> 8) & 0xFF));
+        } else if (value <= 0xFFFFFFL) {
+            out.write(0xFD);
+            out.write((int) (value & 0xFF));
+            out.write((int) ((value >> 8) & 0xFF));
+            out.write((int) ((value >> 16) & 0xFF));
+        } else {
+            out.write(0xFE);
+            for (int i = 0; i < 8; i++) {
+                out.write((int) ((value >> (8 * i)) & 0xFF));
+            }
         }
     }
 
     private static int packedLength(int value) {
-        return value < 251 ? 1 : 3;
+        return packedLength((long) value);
+    }
+
+    private static int packedLength(long value) {
+        if (value < 251) {
+            return 1;
+        } else if (value <= 0xFFFFL) {
+            return 3;
+        } else if (value <= 0xFFFFFFL) {
+            return 4;
+        }
+        return 9;
     }
 }

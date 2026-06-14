@@ -64,6 +64,7 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
@@ -1131,7 +1132,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                     break;
                 }
                 ByteArrayInputStream eventStream = packetLength == MAX_PACKET_LENGTH ?
-                    new ByteArrayInputStream(readPacketSplitInChunks(inputStream, packetLength - 1)) :
+                    new ByteArrayInputStream(new PacketPayloadInputStream(inputStream, packetLength - 1, true)) :
                     inputStream;
                 // A TRANSACTION_PAYLOAD packet unpacks into several inner events; nextEvent() emits the
                 // first and buffers the rest, so keep pulling until this packet (and any payload it
@@ -1187,16 +1188,61 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         updateClientBinlogFilenameAndPosition(event);
     }
 
-    private byte[] readPacketSplitInChunks(ByteArrayInputStream inputStream, int packetLength) throws IOException {
-        byte[] result = inputStream.read(packetLength);
-        int chunkLength;
-        do {
-            chunkLength = inputStream.readInteger(3);
-            inputStream.skip(1); // 1 byte for sequence
-            result = Arrays.copyOf(result, result.length + chunkLength);
-            inputStream.fill(result, result.length - chunkLength, chunkLength);
-        } while (chunkLength == Packet.MAX_LENGTH);
-        return result;
+    static final class PacketPayloadInputStream extends InputStream {
+        private final ByteArrayInputStream inputStream;
+        private int chunkRemaining;
+        private boolean moreChunksExpected;
+
+        PacketPayloadInputStream(ByteArrayInputStream inputStream, int firstChunkRemaining,
+                boolean moreChunksExpected) {
+            this.inputStream = inputStream;
+            this.chunkRemaining = firstChunkRemaining;
+            this.moreChunksExpected = moreChunksExpected;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (!ensureChunkAvailable()) {
+                return -1;
+            }
+            int read = inputStream.read();
+            chunkRemaining--;
+            return read;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (b == null) {
+                throw new NullPointerException();
+            } else if (off < 0 || len < 0 || len > b.length - off) {
+                throw new IndexOutOfBoundsException();
+            } else if (len == 0) {
+                return 0;
+            }
+            if (!ensureChunkAvailable()) {
+                return -1;
+            }
+            int read = inputStream.read(b, off, Math.min(len, chunkRemaining));
+            if (read == -1) {
+                throw new EOFException("Unexpected end of packet; " + chunkRemaining +
+                    " bytes still expected in the current chunk");
+            }
+            chunkRemaining -= read;
+            return read;
+        }
+
+        private boolean ensureChunkAvailable() throws IOException {
+            while (chunkRemaining == 0) {
+                if (!moreChunksExpected) {
+                    return false;
+                }
+                int chunkLength = inputStream.readInteger(3);
+                inputStream.skip(1); // 1 byte for sequence
+                chunkRemaining = chunkLength;
+                moreChunksExpected = chunkLength == Packet.MAX_LENGTH;
+            }
+            return true;
+        }
     }
 
     private void updateClientBinlogFilenameAndPosition(Event event) {

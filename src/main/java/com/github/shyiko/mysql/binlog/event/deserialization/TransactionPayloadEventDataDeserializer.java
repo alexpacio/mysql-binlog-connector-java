@@ -21,6 +21,7 @@ import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 
 import java.io.Closeable;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.EnumSet;
@@ -48,6 +49,11 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
 
     @Override
     public TransactionPayloadEventData deserialize(ByteArrayInputStream inputStream) throws IOException {
+        return deserialize(inputStream, true);
+    }
+
+    TransactionPayloadEventData deserialize(ByteArrayInputStream inputStream, boolean materializePayload)
+            throws IOException {
         TransactionPayloadEventData eventData = new TransactionPayloadEventData();
         eventData.setCompressionType(COMPRESSION_TYPE_NONE);
         // Read the header fields from the event data
@@ -69,7 +75,7 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
             switch (fieldType) {
                 case OTW_PAYLOAD_SIZE_FIELD:
                     // Fetch the payload (compressed) size
-                    eventData.setPayloadSize(readCompressedPayloadSize(inputStream));
+                    eventData.setPayloadSize(inputStream.readPackedLong());
                     break;
                 case OTW_PAYLOAD_COMPRESSION_TYPE_FIELD:
                     // Fetch the compression type
@@ -87,17 +93,22 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
         }
         if (eventData.getUncompressedSize() == 0) {
             // Default the uncompressed to the payload size
-            eventData.setUncompressedSize(eventData.getPayloadSize());
+            eventData.setUncompressedSize(eventData.getPayloadSizeLong());
         }
 
         // Fail fast on an unsupported compression type, before consuming the payload, so it
         // surfaces as a clean deserialization failure rather than later during inner-event streaming.
         requireSupportedCompressionType(eventData.getCompressionType());
+        if (eventData.getPayloadSizeLong() < 0) {
+            throw new IOException("Invalid negative transaction payload size: " +
+                eventData.getPayloadSizeLong());
+        }
 
-        // The compressed payload must fit in a single byte[] (the binlog client reassembles the raw
-        // event into one array regardless). Only the *uncompressed* size may exceed 2GB, which is why
-        // inner events are decompressed and parsed lazily (see iterator()) instead of materialized.
-        eventData.setPayload(inputStream.read(eventData.getPayloadSize()));
+        if (materializePayload && eventData.getPayloadSizeLong() <= Integer.MAX_VALUE) {
+            eventData.setPayload(inputStream.read((int) eventData.getPayloadSizeLong()));
+        } else {
+            eventData.setPayloadInputStream(new BoundedInputStream(inputStream, eventData.getPayloadSizeLong()));
+        }
 
         // Inner events are intentionally NOT materialized here: a compressed transaction is bounded
         // by the transaction size, not by any per-event limit, so eagerly parsing every inner event
@@ -108,25 +119,16 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
 
     /**
      * Opens a single-pass cursor over the transaction's inner events, decompressing the payload
-     * incrementally. Peak memory is bounded by the compressed payload plus one inner event, so a
-     * transaction whose uncompressed image exceeds the 2GB {@code byte[]} limit (or simply does not
-     * fit in heap) is streamed through instead of being materialized whole. The returned iterator
-     * must be {@link InnerEventIterator#close() closed} to release the native decompressor.
+     * incrementally. Peak memory is bounded by the decompressor's buffers plus one inner event, so a
+     * transaction whose compressed or uncompressed image exceeds the 2GB {@code byte[]} limit is
+     * streamed through instead of being materialized whole. The returned iterator must be
+     * {@link InnerEventIterator#close() closed} to release the native decompressor.
      */
     public InnerEventIterator iterator(TransactionPayloadEventData eventData) throws IOException {
         EventDeserializer innerEventDeserializer = new EventDeserializer();
         setCompatibilityMode(innerEventDeserializer);
         ByteArrayInputStream stream = new ByteArrayInputStream(getDecompressedInputStream(eventData));
         return new InnerEventIterator(innerEventDeserializer, stream);
-    }
-
-    private static int readCompressedPayloadSize(ByteArrayInputStream inputStream) throws IOException {
-        long payloadSize = inputStream.readPackedLong();
-        if (payloadSize > Integer.MAX_VALUE) {
-            throw new IOException("Compressed transaction payload size " + payloadSize +
-                " exceeds the maximum supported size of " + Integer.MAX_VALUE + " bytes");
-        }
-        return (int) payloadSize;
     }
 
     private static void requireSupportedCompressionType(int compressionType) throws IOException {
@@ -137,7 +139,14 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
     }
 
     private InputStream getDecompressedInputStream(TransactionPayloadEventData eventData) throws IOException {
-        InputStream payloadInputStream = new java.io.ByteArrayInputStream(eventData.getPayload());
+        InputStream payloadInputStream = eventData.getPayloadInputStream();
+        if (payloadInputStream == null) {
+            byte[] payload = eventData.getPayload();
+            if (payload == null) {
+                throw new IOException("Transaction payload is not available");
+            }
+            payloadInputStream = new java.io.ByteArrayInputStream(payload);
+        }
         switch (eventData.getCompressionType()) {
             case COMPRESSION_TYPE_ZSTD:
                 return new ZstdInputStream(payloadInputStream);
@@ -146,6 +155,57 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
             default:
                 throw new IOException("Unsupported binlog_transaction_compression type: " +
                     eventData.getCompressionType() + " (only ZSTD and NONE are supported)");
+        }
+    }
+
+    /**
+     * Presents exactly {@code length} bytes from an underlying stream without owning/closing it.
+     */
+    static final class BoundedInputStream extends InputStream {
+        private final InputStream inputStream;
+        private long remaining;
+
+        BoundedInputStream(InputStream inputStream, long length) {
+            this.inputStream = inputStream;
+            this.remaining = length;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining == 0) {
+                return -1;
+            }
+            int read = inputStream.read();
+            if (read == -1) {
+                throw new EOFException("Unexpected end of transaction payload; " + remaining +
+                    " bytes still expected");
+            }
+            remaining--;
+            return read;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining == 0) {
+                return -1;
+            }
+            int read = inputStream.read(b, off, (int) Math.min((long) len, remaining));
+            if (read == -1) {
+                throw new EOFException("Unexpected end of transaction payload; " + remaining +
+                    " bytes still expected");
+            }
+            remaining -= read;
+            return read;
+        }
+
+        @Override
+        public int available() throws IOException {
+            return (int) Math.min((long) inputStream.available(), Math.min(remaining, (long) Integer.MAX_VALUE));
+        }
+
+        @Override
+        public void close() throws IOException {
+            // Do not close the owner stream; EventDeserializer drains/skips to the event boundary.
         }
     }
 

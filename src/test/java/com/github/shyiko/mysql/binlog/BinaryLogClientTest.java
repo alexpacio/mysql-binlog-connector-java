@@ -176,6 +176,24 @@ public class BinaryLogClientTest {
         assertEquals(binaryLogClient.getGtidSet(), SERVER_UUID + ":1-7");
     }
 
+    @Test
+    public void testPacketPayloadInputStreamReadsAcrossSplitPackets() throws IOException {
+        ByteArrayOutputStream wire = new ByteArrayOutputStream();
+        wire.write(new byte[] {1, 2, 3}); // bytes remaining in the first full packet after the marker
+        writeInteger(wire, 2, 3);         // continuation packet length
+        wire.write(7);                    // continuation packet sequence
+        wire.write(new byte[] {4, 5});
+
+        InputStream payloadInputStream = new BinaryLogClient.PacketPayloadInputStream(
+            new ByteArrayInputStream(wire.toByteArray()), 3, true);
+        byte[] result = new byte[5];
+
+        assertEquals(payloadInputStream.read(result, 0, 4), 3);
+        assertEquals(payloadInputStream.read(result, 3, 2), 2);
+        assertEquals(payloadInputStream.read(), -1);
+        assertEquals(result, new byte[] {1, 2, 3, 4, 5});
+    }
+
     @Test(timeOut = 15000)
     public void testDisconnectWhileBlockedByFBRead() throws Exception {
         final BinaryLogClient binaryLogClient = new BinaryLogClient("localhost", 33061, "root", "mysql");
@@ -316,6 +334,12 @@ public class BinaryLogClientTest {
             out.write(0xFC);
             out.write(value & 0xFF);
             out.write((value >> 8) & 0xFF);
+        }
+    }
+
+    private static void writeInteger(ByteArrayOutputStream out, int value, int length) {
+        for (int i = 0; i < length; i++) {
+            out.write((value >> (8 * i)) & 0xFF);
         }
     }
 

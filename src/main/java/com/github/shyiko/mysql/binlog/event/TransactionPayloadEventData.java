@@ -1,13 +1,15 @@
 package com.github.shyiko.mysql.binlog.event;
 
+import java.io.InputStream;
 import java.util.ArrayList;
 
 
 public class TransactionPayloadEventData implements EventData {
-    private int payloadSize;
+    private long payloadSize;
     private long uncompressedSize;
     private int compressionType;
     private byte[] payload;
+    private transient InputStream payloadInputStream;
     private ArrayList<Event> uncompressedEvents = new ArrayList<Event>();
 
     public ArrayList<Event> getUncompressedEvents() {
@@ -19,10 +21,22 @@ public class TransactionPayloadEventData implements EventData {
     }
 
     public int getPayloadSize() {
-        return payloadSize;
+        if (payloadSize > Integer.MAX_VALUE) {
+            throw new IllegalStateException("Transaction payload size " + payloadSize +
+                " exceeds the maximum int value");
+        }
+        return (int) payloadSize;
     }
 
     public void setPayloadSize(int payloadSize) {
+        this.payloadSize = payloadSize;
+    }
+
+    public long getPayloadSizeLong() {
+        return payloadSize;
+    }
+
+    public void setPayloadSize(long payloadSize) {
         this.payloadSize = payloadSize;
     }
 
@@ -48,6 +62,14 @@ public class TransactionPayloadEventData implements EventData {
 
     public void setPayload(byte[] payload) {
         this.payload = payload;
+    }
+
+    public InputStream getPayloadInputStream() {
+        return payloadInputStream;
+    }
+
+    public void setPayloadInputStream(InputStream payloadInputStream) {
+        this.payloadInputStream = payloadInputStream;
     }
 
     @Override

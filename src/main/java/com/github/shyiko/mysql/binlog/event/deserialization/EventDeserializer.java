@@ -55,6 +55,8 @@ public class EventDeserializer {
     // consuming anything, whether a payload is still being unpacked (see hasBufferedTransactionPayloadEvent).
     private TransactionPayloadEventDataDeserializer.InnerEventIterator transactionPayloadIterator;
     private EventHeader transactionPayloadEventHeader;
+    private ByteArrayInputStream transactionPayloadInputStream;
+    private int transactionPayloadChecksumLength;
     private Event bufferedTransactionPayloadEvent;
     private IOException transactionPayloadFailure;
 
@@ -281,18 +283,30 @@ public class EventDeserializer {
 
     private Event nextTransactionPayloadEvent(ByteArrayInputStream inputStream, EventHeader eventHeader)
             throws IOException {
-        EventData eventData = deserializeTransactionPayloadEventData(inputStream, eventHeader);
+        EventData eventData = deserializeStreamingTransactionPayloadEventData(inputStream, eventHeader);
         TransactionPayloadEventData transactionPayloadEventData =
             (TransactionPayloadEventData) EventDataWrapper.internal(eventData);
         // Decompress and parse the inner events one at a time so a transaction whose uncompressed image
         // exceeds the 2GB Java-array limit (or simply does not fit in heap) is streamed through with
         // bounded memory instead of being materialized whole.
         transactionPayloadEventHeader = eventHeader;
-        transactionPayloadIterator = openTransactionPayloadIterator(transactionPayloadEventData);
-        // The cursor now owns the bytes it needs; drop the compressed copy so the event (which a reader
-        // typically pins until the next one arrives) does not also retain the whole payload.
-        transactionPayloadEventData.setPayload(null);
-        fillTransactionPayloadBuffer();
+        transactionPayloadInputStream = inputStream;
+        transactionPayloadChecksumLength = checksumLength;
+        try {
+            transactionPayloadIterator = openTransactionPayloadIterator(transactionPayloadEventData);
+            // The cursor now owns the bytes it needs; drop the compressed copy so the event (which a reader
+            // typically pins until the next one arrives) does not also retain the whole payload.
+            transactionPayloadEventData.setPayload(null);
+            transactionPayloadEventData.setPayloadInputStream(null);
+            fillTransactionPayloadBuffer();
+        } catch (IOException | RuntimeException e) {
+            try {
+                closeTransactionPayloadIterator();
+            } catch (IOException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
         if (bufferedTransactionPayloadEvent != null) {
             return takeBufferedTransactionPayloadEvent();
         }
@@ -327,8 +341,13 @@ public class EventDeserializer {
             // Surface it as a plain deserialization failure - never an EOFException/SocketException -
             // so the reader reports it and moves on instead of treating it as a transport failure and
             // reconnecting only to refetch and re-fail on the same payload.
-            closeTransactionPayloadIterator();
-            throw new IOException("Failed to deserialize inner event of TRANSACTION_PAYLOAD", e);
+            IOException failure = new IOException("Failed to deserialize inner event of TRANSACTION_PAYLOAD", e);
+            try {
+                closeTransactionPayloadIterator();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
         }
         if (innerEvent == null) {
             closeTransactionPayloadIterator();
@@ -338,16 +357,42 @@ public class EventDeserializer {
         bufferedTransactionPayloadEvent = innerEvent;
     }
 
-    private void closeTransactionPayloadIterator() {
+    private void closeTransactionPayloadIterator() throws IOException {
+        IOException failure = null;
         if (transactionPayloadIterator != null) {
             try {
                 transactionPayloadIterator.close();
             } catch (IOException e) {
-                // best-effort release of the streaming (zstd) decompressor
+                failure = e;
             }
             transactionPayloadIterator = null;
         }
-        transactionPayloadEventHeader = null;
+        try {
+            finishTransactionPayloadBlock();
+        } catch (IOException e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        } finally {
+            transactionPayloadEventHeader = null;
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private void finishTransactionPayloadBlock() throws IOException {
+        if (transactionPayloadInputStream != null) {
+            try {
+                transactionPayloadInputStream.skipToTheEndOfTheBlock();
+                transactionPayloadInputStream.skip(transactionPayloadChecksumLength);
+            } finally {
+                transactionPayloadInputStream = null;
+                transactionPayloadChecksumLength = 0;
+            }
+        }
     }
 
     // Inner events are decoded from the payload's own byte stream, so their headers carry positions
@@ -424,6 +469,30 @@ public class EventDeserializer {
         return eventData;
     }
 
+    private EventData deserializeStreamingTransactionPayloadEventData(
+            ByteArrayInputStream inputStream, EventHeader eventHeader) throws EventDataDeserializationException {
+        EventDataDeserializer eventDataDeserializer = eventDataDeserializers.get(EventType.TRANSACTION_PAYLOAD);
+        if (!(eventDataDeserializer instanceof TransactionPayloadEventDataDeserializer)) {
+            return deserializeEventData(inputStream, eventHeader, eventDataDeserializer);
+        }
+
+        long eventBodyLength = eventHeader.getDataLength() - checksumLength;
+        EventData eventData;
+        try {
+            inputStream.enterBlock(eventBodyLength);
+            eventData = ((TransactionPayloadEventDataDeserializer) eventDataDeserializer).deserialize(inputStream, false);
+        } catch (IOException e) {
+            try {
+                inputStream.skipToTheEndOfTheBlock();
+                inputStream.skip(checksumLength);
+            } catch (IOException skipFailure) {
+                e.addSuppressed(skipFailure);
+            }
+            throw new EventDataDeserializationException(eventHeader, e);
+        }
+        return eventData;
+    }
+
     /**
      * Opens a streaming cursor over the inner events of a transaction payload, delegating to the
      * registered {@link TransactionPayloadEventDataDeserializer} (which carries the compatibility
@@ -462,11 +531,15 @@ public class EventDeserializer {
 
     private EventData deserializeEventData(ByteArrayInputStream inputStream, EventHeader eventHeader,
             EventDataDeserializer eventDataDeserializer) throws EventDataDeserializationException {
-        int eventBodyLength = (int) eventHeader.getDataLength() - checksumLength;
+        long eventBodyLength = eventHeader.getDataLength() - checksumLength;
         EventData eventData;
         try {
             inputStream.enterBlock(eventBodyLength);
             try {
+                if (eventBodyLength > Integer.MAX_VALUE) {
+                    throw new IOException("Event data length " + eventBodyLength +
+                        " exceeds the maximum supported size of " + Integer.MAX_VALUE + " bytes");
+                }
                 eventData = eventDataDeserializer.deserialize(inputStream);
             } finally {
                 inputStream.skipToTheEndOfTheBlock();
