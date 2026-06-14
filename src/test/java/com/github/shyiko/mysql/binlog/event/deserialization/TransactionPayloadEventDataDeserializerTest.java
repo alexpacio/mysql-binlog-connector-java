@@ -195,7 +195,30 @@ public class TransactionPayloadEventDataDeserializerTest {
         assertEquals(12345L, firstInner.getNextPosition());
         // ...while the standalone event read after the payload keeps its own (default 27 / 0).
         assertEquals(27L, ((EventHeaderV4) events.get(2).getHeader()).getEventLength());
-        assertFalse(eventDeserializer.hasBufferedTransactionPayloadEvent());
+        assertFalse(eventDeserializer.hasPendingTransactionPayloadEvent());
+    }
+
+    @Test
+    public void nextEventDoesNotPrefetchNextInnerEvent() throws IOException {
+        EventDeserializer eventDeserializer = new EventDeserializer();
+        byte[] firstInnerEvent = xidEventBytes(111L);
+        byte[] secondInnerEvent = xidEventBytes(222L);
+        byte[] payloadEvent = transactionPayloadEvent(12345L, firstInnerEvent, secondInnerEvent);
+        ByteArrayInputStream stream = new ByteArrayInputStream(payloadEvent);
+
+        Event firstEvent = eventDeserializer.nextEvent(stream);
+
+        assertEquals(EventType.XID, firstEvent.getHeader().getEventType());
+        assertEquals(111L, ((XidEventData) firstEvent.getData()).getXid());
+        assertEquals(stream.getLongPosition(), payloadEvent.length - secondInnerEvent.length);
+        assertTrue(eventDeserializer.hasPendingTransactionPayloadEvent());
+
+        Event secondEvent = eventDeserializer.nextEvent(stream);
+
+        assertEquals(EventType.XID, secondEvent.getHeader().getEventType());
+        assertEquals(222L, ((XidEventData) secondEvent.getData()).getXid());
+        assertEquals(stream.getLongPosition(), payloadEvent.length);
+        assertFalse(eventDeserializer.hasPendingTransactionPayloadEvent());
     }
 
     private static List<Event> drain(TransactionPayloadEventDataDeserializer.InnerEventIterator iterator)

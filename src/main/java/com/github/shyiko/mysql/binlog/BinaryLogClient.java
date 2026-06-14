@@ -1160,7 +1160,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                         eventLastSeen = System.currentTimeMillis();
                         handleEvent(event);
                     }
-                } while (eventDeserializer.hasBufferedTransactionPayloadEvent());
+                } while (eventDeserializer.hasPendingTransactionPayloadEvent());
             }
         } catch (Exception e) {
             if (isConnected()) {

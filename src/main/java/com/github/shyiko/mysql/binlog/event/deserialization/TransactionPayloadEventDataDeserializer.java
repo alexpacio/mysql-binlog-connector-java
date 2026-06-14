@@ -128,7 +128,7 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
         EventDeserializer innerEventDeserializer = new EventDeserializer();
         setCompatibilityMode(innerEventDeserializer);
         ByteArrayInputStream stream = new ByteArrayInputStream(getDecompressedInputStream(eventData));
-        return new InnerEventIterator(innerEventDeserializer, stream);
+        return new InnerEventIterator(innerEventDeserializer, stream, eventData.getUncompressedSize());
     }
 
     private static void requireSupportedCompressionType(int compressionType) throws IOException {
@@ -227,10 +227,14 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
     public static final class InnerEventIterator implements Closeable {
         private EventDeserializer eventDeserializer;
         private ByteArrayInputStream inputStream;
+        private final long uncompressedSize;
+        private boolean exhausted;
 
-        InnerEventIterator(EventDeserializer eventDeserializer, ByteArrayInputStream inputStream) {
+        InnerEventIterator(EventDeserializer eventDeserializer, ByteArrayInputStream inputStream,
+                long uncompressedSize) {
             this.eventDeserializer = eventDeserializer;
             this.inputStream = inputStream;
+            this.uncompressedSize = uncompressedSize;
         }
 
         /**
@@ -242,11 +246,34 @@ public class TransactionPayloadEventDataDeserializer implements EventDataDeseria
             if (inputStream == null) {
                 return null;
             }
+            if (inputStream.getLongPosition() == uncompressedSize) {
+                exhausted = true;
+                close();
+                return null;
+            }
             Event event = eventDeserializer.nextEvent(inputStream);
             if (event == null) {
+                exhausted = true;
                 close();
+            } else {
+                long position = inputStream.getLongPosition();
+                if (position > uncompressedSize) {
+                    IOException failure = new IOException("Inner events consumed " + position +
+                        " bytes, exceeding transaction payload uncompressed size " + uncompressedSize);
+                    try {
+                        close();
+                    } catch (IOException closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                    throw failure;
+                }
+                exhausted = position == uncompressedSize;
             }
             return event;
+        }
+
+        boolean isExhausted() {
+            return exhausted || inputStream == null;
         }
 
         @Override

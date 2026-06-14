@@ -51,13 +51,11 @@ public class EventDeserializer {
 
     // State for transparently unpacking a TRANSACTION_PAYLOAD: once nextEvent() reads such an event
     // it streams the inner events out one per call (carrying the outer envelope's coordinates) before
-    // it touches the underlying stream again. One event is read ahead so callers can tell, without
-    // consuming anything, whether a payload is still being unpacked (see hasBufferedTransactionPayloadEvent).
+    // it touches the underlying stream again.
     private TransactionPayloadEventDataDeserializer.InnerEventIterator transactionPayloadIterator;
     private EventHeader transactionPayloadEventHeader;
     private ByteArrayInputStream transactionPayloadInputStream;
     private int transactionPayloadChecksumLength;
-    private Event bufferedTransactionPayloadEvent;
     private IOException transactionPayloadFailure;
 
     public EventDeserializer() {
@@ -247,8 +245,11 @@ public class EventDeserializer {
             transactionPayloadFailure = null;
             throw failure;
         }
-        if (bufferedTransactionPayloadEvent != null) {
-            return takeBufferedTransactionPayloadEvent();
+        if (transactionPayloadIterator != null) {
+            Event event = nextTransactionPayloadInnerEvent();
+            if (event != null) {
+                return event;
+            }
         }
         if (inputStream.peek() == -1) {
             return null;
@@ -273,12 +274,11 @@ public class EventDeserializer {
 
     /**
      * @return {@code true} while a previously-read TRANSACTION_PAYLOAD still has inner events (or a
-     * deferred unpack failure) to emit. The next {@link #nextEvent} call will return one of them
-     * without touching the underlying stream, so a packet-oriented reader knows not to pull the next
-     * packet yet.
+     * deferred unpack failure) to emit, so a packet-oriented reader knows not to pull the next packet
+     * yet.
      */
-    public boolean hasBufferedTransactionPayloadEvent() {
-        return bufferedTransactionPayloadEvent != null || transactionPayloadFailure != null;
+    public boolean hasPendingTransactionPayloadEvent() {
+        return transactionPayloadIterator != null || transactionPayloadFailure != null;
     }
 
     private Event nextTransactionPayloadEvent(ByteArrayInputStream inputStream, EventHeader eventHeader)
@@ -298,7 +298,10 @@ public class EventDeserializer {
             // typically pins until the next one arrives) does not also retain the whole payload.
             transactionPayloadEventData.setPayload(null);
             transactionPayloadEventData.setPayloadInputStream(null);
-            fillTransactionPayloadBuffer();
+            Event innerEvent = nextTransactionPayloadInnerEvent();
+            if (innerEvent != null) {
+                return innerEvent;
+            }
         } catch (IOException | RuntimeException e) {
             try {
                 closeTransactionPayloadIterator();
@@ -307,31 +310,12 @@ public class EventDeserializer {
             }
             throw e;
         }
-        if (bufferedTransactionPayloadEvent != null) {
-            return takeBufferedTransactionPayloadEvent();
-        }
         // A payload with no inner events is not expected from MySQL; if it happens, surface the wrapper
         // itself rather than returning null (which a reader would mistake for end-of-stream).
-        closeTransactionPayloadIterator();
         return new Event(eventHeader, eventData);
     }
 
-    private Event takeBufferedTransactionPayloadEvent() throws IOException {
-        Event innerEvent = bufferedTransactionPayloadEvent;
-        bufferedTransactionPayloadEvent = null;
-        if (transactionPayloadIterator != null) {
-            try {
-                fillTransactionPayloadBuffer();
-            } catch (IOException e) {
-                // Hand back the (valid) event we already hold and report the parse failure on the
-                // next call, so inner events stay in order.
-                transactionPayloadFailure = e;
-            }
-        }
-        return innerEvent;
-    }
-
-    private void fillTransactionPayloadBuffer() throws IOException {
+    private Event nextTransactionPayloadInnerEvent() throws IOException {
         Event innerEvent;
         try {
             innerEvent = transactionPayloadIterator.next();
@@ -351,10 +335,19 @@ public class EventDeserializer {
         }
         if (innerEvent == null) {
             closeTransactionPayloadIterator();
-            return;
+            return null;
         }
         stampOuterEventCoordinates(transactionPayloadEventHeader, innerEvent);
-        bufferedTransactionPayloadEvent = innerEvent;
+        if (transactionPayloadIterator.isExhausted()) {
+            try {
+                closeTransactionPayloadIterator();
+            } catch (IOException e) {
+                // Hand back the (valid) event we already hold and report the close/skip failure on the
+                // next call, so inner events stay in order.
+                transactionPayloadFailure = e;
+            }
+        }
+        return innerEvent;
     }
 
     private void closeTransactionPayloadIterator() throws IOException {
